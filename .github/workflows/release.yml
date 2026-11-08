@@ -130,6 +130,18 @@ jobs:
             mingw-w64-clang-x86_64-spirv-tools
             mingw-w64-clang-x86_64-spirv-headers
             mingw-w64-clang-x86_64-spirv-cross
+      # make_portable.py bundles DXC for the native renderer's shader build; the maintainers keep
+      # it beside the checkout (../OCTR-vulkan-lab-tools/dxc), so a fork's runner fetches it
+      - name: DirectX Shader Compiler
+        shell: pwsh
+        run: |
+          $rel = Invoke-RestMethod -Headers @{ Authorization = "Bearer ${{ github.token }}" } https://api.github.com/repos/microsoft/DirectXShaderCompiler/releases/latest
+          $asset = $rel.assets | Where-Object { $_.name -match '^dxc_.*\.zip$' } | Select-Object -First 1
+          $dest = Join-Path (Split-Path $env:GITHUB_WORKSPACE -Parent) 'OCTR-vulkan-lab-tools/dxc'
+          New-Item -ItemType Directory -Force $dest | Out-Null
+          Invoke-WebRequest $asset.browser_download_url -OutFile "$env:RUNNER_TEMP/dxc.zip"
+          Expand-Archive "$env:RUNNER_TEMP/dxc.zip" -DestinationPath $dest -Force
+          Get-ChildItem "$dest/bin/x64"
       - name: Build and package Windows ZIP
         env:
           MSYS2_ROOT: ${{ steps.msys2.outputs.msys2-location }}
