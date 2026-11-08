@@ -135,7 +135,7 @@ jobs:
           MSYS2_ROOT: ${{ steps.msys2.outputs.msys2-location }}
         run: |
           set -euo pipefail
-          version=$(git describe --tags --match 'v*' --always)
+          version=v0.8.3-correcao-native  # fork build: the tag is not in this fork; the online reads 0.8.3
           bash build.sh
           python3 packaging/windows/make_portable.py --version "$version"
           asset="CTR-NitroFueled-PC-portable-${version}-windows.zip"
