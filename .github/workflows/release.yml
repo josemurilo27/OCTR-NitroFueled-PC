@@ -133,9 +133,12 @@ jobs:
       - name: Build and package Windows ZIP
         env:
           MSYS2_ROOT: ${{ steps.msys2.outputs.msys2-location }}
+          # fork build without the release tag: the game and network code are v0.8.3's unchanged
+          # (only the native renderer's present pacing differs), so it joins v0.8.3 players online
+          BB_VERSION: v0.8.3
         run: |
           set -euo pipefail
-          version=v0.8.3-correcao-native  # fork build: the tag is not in this fork; the online reads 0.8.3
+          version=v0.8.3-correcao-native
           bash build.sh
           python3 packaging/windows/make_portable.py --version "$version"
           asset="CTR-NitroFueled-PC-portable-${version}-windows.zip"
