@@ -124,6 +124,9 @@ s32 PS4_SYSV_ABI sceVideoOutAddVblankEvent(Kernel::OrbisKernelEqueue eq, s32 han
 s32 PS4_SYSV_ABI sceVideoOutRegisterBuffers(s32 handle, s32 startIndex, void* const* addresses,
                                             s32 bufferNum, const BufferAttribute* attribute);
 s32 PS4_SYSV_ABI sceVideoOutGetBufferLabelAddress(s32 handle, uintptr_t* label_addr);
+/// bbport: the (left) address of registered display buffer `index` of port `handle`, 0 if none
+/// (the native renderer's present pacing).
+uintptr_t BufferAddressForNative(s32 handle, u32 index);
 s32 PS4_SYSV_ABI sceVideoOutSetFlipRate(s32 handle, s32 rate);
 s32 PS4_SYSV_ABI sceVideoOutIsFlipPending(s32 handle);
 s32 PS4_SYSV_ABI sceVideoOutWaitVblank(s32 handle);

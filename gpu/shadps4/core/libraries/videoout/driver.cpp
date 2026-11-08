@@ -19,6 +19,7 @@
 #include "bbport_heap_sites.h"
 #include "bbport_wait_trace.h"
 #include "bbport_native_signals.h"
+#include "bbport_native_vk.h"
 #include "bbport_native_memory.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
 #include "common/debug.h"
@@ -796,6 +797,8 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         frame = nullptr;
         if (is_eop && BbSignals::OwnPresent()) {
             frame = presenter->PrepareNativeFrame(group, buffer.address_left);
+            // its read is on the queue now (or there was none): the next frame in it may go
+            BbNativeVk::Presented(buffer.address_left);
             if (!frame && BbMem::NativeOnly()) {
                 frame = presenter->PrepareBlankFrame(false); // no Rasterizer to read it from
             } else if (!frame) {

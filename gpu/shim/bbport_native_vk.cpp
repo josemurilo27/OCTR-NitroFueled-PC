@@ -39,6 +39,7 @@
 #include "bbport_native_vk_gpu.h"
 #include "bbport_native_vk_spirv.h"
 #include "bbport_native_vk_texture.h"
+#include "bbport_native_signals.h"
 
 #include "video_core/renderer_vulkan/bb_hud_scale.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -259,6 +260,13 @@ struct Shown {
 };
 std::mutex display_mutex;
 std::unordered_map<u64, Shown> shown;
+
+/// Present pacing (NoteFlip / Presented / PaceBeforeSubmit).
+std::mutex pace_mutex;
+std::condition_variable pace_cv;
+std::unordered_map<u64, std::deque<u64>> pending_flips; // address -> submissions that flip it, not read yet
+std::atomic<u64> pace_waits{0}, pace_wait_ns{0}, pace_timeouts{0};
+bool PacingOn();
 
 std::atomic<u64> draws{0}, resolved{0}, missing_shader{0}, no_target{0}, no_context{0};
 std::atomic<u64> wrong_stage{0}; // a program bound in a stage it is not for (stale context state)
@@ -940,6 +948,59 @@ std::mutex gpu_mutex; // held while recording (Gpu is not thread safe; Report re
 std::atomic<u64> submits_queued{0}, submits_recorded{0}, batch_waits{0};
 std::mutex recorded_mutex;
 std::condition_variable recorded_cv;
+
+/// Present pacing, recorder side: the display buffers the presenter reads (RunSubmit), by address.
+std::unordered_map<u64, Target*> display_targets;
+
+bool PacingOn() {
+    static const bool env_on = [] {
+        const char* e = std::getenv("BB_VK_PRESENT_PACING");
+        return !(e && e[0] == '0');
+    }();
+    return env_on && BbSignals::OwnPresent();
+}
+
+/// Gpu's hook before each command buffer goes to the queue (recording thread, gpu_mutex held):
+/// a command buffer that writes a display image whose earlier flip the presenter has not read yet
+/// waits for that read, so the read reaches the queue first.
+void PaceBeforeSubmit() {
+    if (display_targets.empty() || !PacingOn()) {
+        return;
+    }
+    const u64 serial = Gpu::RecordSerial();
+    const u64 k = submits_recorded.load(std::memory_order_acquire) + 1; // the one being recorded
+    std::unique_lock lk(pace_mutex);
+    for (const auto& [address, t] : display_targets) {
+        if (t->img.touched != serial) {
+            continue;
+        }
+        const auto it = pending_flips.find(address);
+        if (it == pending_flips.end()) {
+            continue;
+        }
+        std::deque<u64>& q = it->second;
+        const auto ready = [&q, k] { return q.empty() || q.front() >= k; };
+        if (ready()) {
+            continue;
+        }
+        pace_waits.fetch_add(1, std::memory_order_relaxed);
+        const auto start = std::chrono::steady_clock::now();
+        if (!pace_cv.wait_for(lk, std::chrono::milliseconds(250), ready)) {
+            // the presenter never read it (a flip refused or not shown): stop waiting on it
+            if (pace_timeouts.fetch_add(1, std::memory_order_relaxed) < 4) {
+                std::printf("Native Vulkan: present pacing: display buffer %llx not read after "
+                            "250 ms; going on\n", (unsigned long long)address);
+            }
+            while (!ready()) {
+                q.pop_front();
+            }
+        }
+        pace_wait_ns.fetch_add(u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now() - start)
+                                       .count()),
+                               std::memory_order_relaxed);
+    }
+}
 // the GPU timeline value once submission k (submits_recorded) is on the queue (BB_VK_OWN_SIGNALS)
 constexpr u64 SubmitValueRing = 4096;
 std::atomic<u64> submit_values[SubmitValueRing]{};
@@ -4147,6 +4208,9 @@ void StartTextures() {
                       Gpu::Init(*inst, shader_root.empty()
                                            ? std::string()
                                            : (shader_root / "pipeline_cache.bin").string());
+            if (drawing) {
+                Gpu::SetBeforeSubmit(&PaceBeforeSubmit);
+            }
             const char* sh = std::getenv("BB_VK_SHOW");
             show = drawing && sh && sh[0] == '1';
             const char* al = std::getenv("BB_VK_ALONE");
@@ -4384,6 +4448,17 @@ void Report() {
                         (unsigned long long)copies_in_place.load(),
                         (unsigned long long)copies_twinned.load(),
                         (unsigned long long)stale_reads.load(), reasons.c_str());
+            if (PacingOn()) {
+                static u64 last_pace_waits = 0, last_pace_ns = 0, last_pace_timeouts = 0;
+                const u64 pw = pace_waits.load(), pn2 = pace_wait_ns.load(), pt = pace_timeouts.load();
+                std::printf("Native Vulkan: present pacing: %.1f waits/s, %.1f ms/s holding a frame "
+                            "for the presenter, %llu given up (BB_VK_PRESENT_PACING=0 turns it off)\n",
+                            (pw - last_pace_waits) / 5.0, (pn2 - last_pace_ns) / 5e6,
+                            (unsigned long long)(pt - last_pace_timeouts));
+                last_pace_waits = pw;
+                last_pace_ns = pn2;
+                last_pace_timeouts = pt;
+            }
             {
                 std::size_t queued = 0;
                 {
@@ -4818,13 +4893,25 @@ void RenderDocCapture(bool) {}
 #endif
 
 void RunSubmit(const SubmitPacket& sp) {
+    // what the presenter will read; published once this submission is on the queue: before that,
+    // a flip still waiting (present pacing holds this submission for it) must read the old image
+    std::vector<std::pair<u64, Shown>> publish;
+    publish.reserve(sp.shown.size());
     for (const auto& [address, t] : sp.shown) {
         BeforeRead(&t->img); // the presenter reads it
+        const u64 touched = t->img.touched;
         Gpu::Use(t->img, vk::ImageLayout::eGeneral);
-        std::lock_guard dl(display_mutex);
-        shown[address] = Shown{t->img.image, t->img.format, t->img.width, t->img.height};
+        t->img.touched = touched; // handing it to the presenter is not a write of this frame
+        publish.push_back({address, Shown{t->img.image, t->img.format, t->img.width, t->img.height}});
+        display_targets[address] = t;
     }
     Gpu::Submit();
+    if (!publish.empty()) {
+        std::lock_guard dl(display_mutex);
+        for (const auto& [address, v] : publish) {
+            shown[address] = v;
+        }
+    }
     RenderDocCapture(true);
     {
         std::lock_guard rl(recorded_mutex);
@@ -4836,6 +4923,9 @@ void RunSubmit(const SubmitPacket& sp) {
 }
 
 void RunRetire(std::unique_ptr<Target>& t) {
+    for (auto it = display_targets.begin(); it != display_targets.end();) {
+        it = it->second == t.get() ? display_targets.erase(it) : std::next(it);
+    }
     FlushCopiesFrom(&t->img);
     DropCopyInto(&t->img);
     Gpu::EndRendering(); // the open pass may be drawing to it
@@ -5042,8 +5132,10 @@ bool Display(std::uint64_t address, std::uint32_t wanted, std::uint64_t* image,
     if (!show) {
         return false;
     }
-    if (record_thread) {
-        // the submissions so far (this frame's among them) are recorded and on the queue first
+    if (record_thread && !PacingOn()) {
+        // the submissions so far (this frame's among them) are recorded and on the queue first.
+        // Not with present pacing: the flip runs once the GPU finished its own submission (so it
+        // is on the queue), and the recorder may be holding a later one for this very flip
         const u64 want = submits_queued.load(std::memory_order_acquire);
         std::unique_lock rl(recorded_mutex);
         recorded_cv.wait_for(rl, std::chrono::milliseconds(200),
@@ -5067,5 +5159,31 @@ bool Display(std::uint64_t address, std::uint32_t wanted, std::uint64_t* image,
     *width = s.width;
     *height = s.height;
     return true;
+}
+
+void NoteFlip(std::uint64_t address) {
+    if (!PacingOn()) {
+        return;
+    }
+    std::lock_guard lk(pace_mutex);
+    auto& q = pending_flips[address];
+    q.push_back(submits_queued.load(std::memory_order_acquire));
+    while (q.size() > 8) {
+        q.pop_front(); // the presenter never read these: no frame waits on them
+    }
+}
+
+void Presented(std::uint64_t address) {
+    if (!PacingOn()) {
+        return;
+    }
+    {
+        std::lock_guard lk(pace_mutex);
+        const auto it = pending_flips.find(address);
+        if (it != pending_flips.end() && !it->second.empty()) {
+            it->second.pop_front();
+        }
+    }
+    pace_cv.notify_all();
 }
 } // namespace BbNativeVk

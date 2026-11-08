@@ -76,6 +76,8 @@ std::size_t current = 0;
 // counts the submitted command buffers on the GPU (BB_VK_OWN_SIGNALS waits on it from its thread)
 vk::Semaphore timeline;
 std::atomic<u64> timeline_submitted{0};
+u64 record_serial = 1;                 // the command buffer being recorded (RecordSerial)
+void (*before_submit)() = nullptr;     // SetBeforeSubmit
 
 // lab: 16 bytes of zeros, then a float4 of ones, for vertex inputs no engine element feeds
 VkBuffer constant_vertices = VK_NULL_HANDLE;
@@ -253,6 +255,9 @@ LayoutUse UseOf(vk::ImageLayout layout) {
 /// it does not change (a second pass or copy into it waits for the first).
 void Transition(Image& image, vk::ImageLayout layout) {
     const LayoutUse from = UseOf(image.layout), to = UseOf(layout);
+    if (to.write) {
+        image.touched = record_serial;
+    }
     if (image.layout == layout && !from.write && !image.discard) {
         return;
     }
@@ -444,6 +449,9 @@ void SubmitFrame(bool early) {
     if (!f.recorded && !f.prelude_open) {
         return;
     }
+    if (before_submit) {
+        before_submit(); // may wait for the presenter (BbNativeVk present pacing)
+    }
     std::array<vk::CommandBuffer, 2> cmds{f.cmd};
     u32 count = 1;
     if (f.prelude_open) {
@@ -485,6 +493,7 @@ void SubmitFrame(bool early) {
         timeline_submitted.store(value, std::memory_order_release);
     }
     f.in_flight = r == vk::Result::eSuccess;
+    ++record_serial;
     ++stats.submits;
     stats.early_submits += early;
     current = (current + 1) % FrameCount;
@@ -660,6 +669,14 @@ void Invalidate() {
 
 void Submit() {
     SubmitFrame(false);
+}
+
+u64 RecordSerial() {
+    return record_serial;
+}
+
+void SetBeforeSubmit(void (*hook)()) {
+    before_submit = hook;
 }
 
 void Defer(std::function<void()> f) {

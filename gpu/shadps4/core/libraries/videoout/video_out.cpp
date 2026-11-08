@@ -342,6 +342,14 @@ s32 PS4_SYSV_ABI sceVideoOutGetBufferLabelAddress(s32 handle, uintptr_t* label_a
     return 16;
 }
 
+uintptr_t BufferAddressForNative(s32 handle, u32 index) {
+    auto* port = driver ? driver->GetPort(handle) : nullptr;
+    if (!port || index >= port->buffer_slots.size() || port->buffer_slots[index].group_index < 0) {
+        return 0;
+    }
+    return port->buffer_slots[index].address_left;
+}
+
 s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, void** unk) {
     auto* port = driver->GetPort(handle);
     if (!port) {

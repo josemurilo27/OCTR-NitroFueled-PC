@@ -36,6 +36,9 @@ struct Image {
     vk::ImageAspectFlags clear{};
     vk::ClearValue clear_value{};
     bool discard = false; // the next layout change may drop the contents (all of them are cleared)
+    // RecordSerial() of the last command buffer that changed it to a layout that writes (present
+    // pacing: a display image written again must wait until the presenter has read its last flip)
+    std::uint64_t touched = 0;
 };
 
 /// Attachments of a rendering pass. `depth_read_only`: the depth image is also sampled;
@@ -105,6 +108,12 @@ void Invalidate();
 
 /// Ends the open command buffer and submits it. Nothing happens when nothing was recorded.
 void Submit();
+
+/// The command buffer being recorded: 1, 2, ... (one more after each submission to the queue).
+std::uint64_t RecordSerial();
+/// Called on the recording thread right before each command buffer goes to the queue (normal and
+/// early submissions), outside the queue lock: it may wait (present pacing).
+void SetBeforeSubmit(void (*hook)());
 
 /// Runs `f` once the GPU has finished everything recorded so far.
 void Defer(std::function<void()> f);

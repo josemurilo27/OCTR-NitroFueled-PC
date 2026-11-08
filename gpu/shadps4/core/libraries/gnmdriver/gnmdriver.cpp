@@ -2514,6 +2514,10 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
     if (patch_result != ORBIS_OK) {
         return patch_result;
     }
+    // bbport: present pacing - this submission (just handed to the native renderer) flips it
+    if (const uintptr_t shown = VideoOut::BufferAddressForNative(s32(vo_handle), buf_idx)) {
+        BbNativeVk::NoteFlip(shown);
+    }
 
     const s32 result = PerformSubmit(count, const_cast<const u32**>(dcb_gpu_addrs), dcb_sizes_in_bytes,
                                      const_cast<const u32**>(ccb_gpu_addrs), ccb_sizes_in_bytes);

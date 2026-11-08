@@ -52,4 +52,15 @@ bool GpuTimeline();
 /// view format for that buffer).
 bool Display(std::uint64_t address, std::uint32_t wanted, std::uint64_t* image,
              std::uint32_t* view_format, std::uint32_t* width, std::uint32_t* height);
+
+/// Present pacing (BB_VK_OWN_SIGNALS with the native presenter; BB_VK_PRESENT_PACING=0 turns it
+/// off). The game flips display buffer `address` at the end of the submission it just handed over
+/// (call after OnSubmit). Until the presenter has read that flip (Presented), the recorder holds
+/// back any later command buffer that writes the same display image: with early labels the game
+/// runs frames ahead, and without this its next frame in the same buffer reached the GPU queue
+/// before the presenter's read of the last one (frames shown out of order: a picture that seems
+/// frozen or flickers between two frames while the FPS counter looks fine).
+void NoteFlip(std::uint64_t address);
+/// The presenter's read of the oldest flip of `address` is on the queue (or was given up).
+void Presented(std::uint64_t address);
 } // namespace BbNativeVk
