@@ -38,6 +38,7 @@ struct Frame {
     u64 ready_tick;
     bool is_hdr{false};
     u8 id{};
+    u64 bb_seq{}; ///< bbport diagnostics: order PrepareNativeFrame made it in (0: other paths)
 
 };
 

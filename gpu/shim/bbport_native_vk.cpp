@@ -257,7 +257,18 @@ struct Shown {
     VkImage image = VK_NULL_HANDLE;
     vk::Format format = vk::Format::eUndefined;
     u32 width = 0, height = 0;
+    u64 written_k = 0; // diagnostics: the last submission that wrote this display image
 };
+/// Diagnostics: what each display buffer showed at its last flip, and counters for the report.
+struct LastFlip {
+    VkImage image = VK_NULL_HANDLE;
+    u64 written_k = 0;
+};
+std::unordered_map<u64, LastFlip> last_flips; // under display_mutex
+std::atomic<u64> diag_flips{0}, diag_stale{0}, diag_image_changed{0}, diag_max_age{0},
+    diag_not_shown{0}, diag_presented{0}, diag_out_of_order{0}, diag_skipped{0},
+    diag_present_seq{0}, diag_last_presented{0};
+std::atomic<int> diag_detail_left{40};
 std::mutex display_mutex;
 std::unordered_map<u64, Shown> shown;
 
@@ -4448,6 +4459,18 @@ void Report() {
                         (unsigned long long)copies_in_place.load(),
                         (unsigned long long)copies_twinned.load(),
                         (unsigned long long)stale_reads.load(), reasons.c_str());
+            std::printf("Native present diag (5 s): %llu flips shown, %llu showed a display buffer "
+                        "with the same frame as its last flip, %llu with another image, %llu with "
+                        "no image; oldest frame %llu submissions behind; presenter: %llu presented, "
+                        "%llu out of order, %llu prepared but never presented\n",
+                        (unsigned long long)diag_flips.exchange(0),
+                        (unsigned long long)diag_stale.exchange(0),
+                        (unsigned long long)diag_image_changed.exchange(0),
+                        (unsigned long long)diag_not_shown.exchange(0),
+                        (unsigned long long)diag_max_age.exchange(0),
+                        (unsigned long long)diag_presented.exchange(0),
+                        (unsigned long long)diag_out_of_order.exchange(0),
+                        (unsigned long long)diag_skipped.exchange(0));
             if (PacingOn()) {
                 static u64 last_pace_waits = 0, last_pace_ns = 0, last_pace_timeouts = 0;
                 const u64 pw = pace_waits.load(), pn2 = pace_wait_ns.load(), pt = pace_timeouts.load();
@@ -4897,15 +4920,23 @@ void RunSubmit(const SubmitPacket& sp) {
     // a flip still waiting (present pacing holds this submission for it) must read the old image
     std::vector<std::pair<u64, Shown>> publish;
     publish.reserve(sp.shown.size());
+    static u64 first_serial = 1;                      // the first command buffer of this submission
+    static std::unordered_map<u64, u64> written_at;   // address -> last submission that wrote it
+    const u64 this_k = submits_recorded.load(std::memory_order_relaxed) + 1;
     for (const auto& [address, t] : sp.shown) {
         BeforeRead(&t->img); // the presenter reads it
         const u64 touched = t->img.touched;
+        if (touched >= first_serial) {
+            written_at[address] = this_k;
+        }
         Gpu::Use(t->img, vk::ImageLayout::eGeneral);
         t->img.touched = touched; // handing it to the presenter is not a write of this frame
-        publish.push_back({address, Shown{t->img.image, t->img.format, t->img.width, t->img.height}});
+        publish.push_back({address, Shown{t->img.image, t->img.format, t->img.width, t->img.height,
+                                          written_at[address]}});
         display_targets[address] = t;
     }
     Gpu::Submit();
+    first_serial = Gpu::RecordSerial();
     if (!publish.empty()) {
         std::lock_guard dl(display_mutex);
         for (const auto& [address, v] : publish) {
@@ -5144,7 +5175,31 @@ bool Display(std::uint64_t address, std::uint32_t wanted, std::uint64_t* image,
     std::lock_guard lk(display_mutex);
     const Shown& s = shown[address]; // asks OnSubmit to hand this buffer over from now on
     if (!s.image) {
+        diag_not_shown.fetch_add(1, std::memory_order_relaxed);
         return false;
+    }
+    {
+        diag_flips.fetch_add(1, std::memory_order_relaxed);
+        LastFlip& lf = last_flips[address];
+        const u64 now_k = submits_recorded.load(std::memory_order_acquire);
+        const u64 age = now_k > s.written_k ? now_k - s.written_k : 0;
+        if (age > diag_max_age.load(std::memory_order_relaxed)) {
+            diag_max_age.store(age, std::memory_order_relaxed);
+        }
+        const bool stale = lf.image && s.written_k == lf.written_k;
+        const bool changed = lf.image && s.image != lf.image;
+        diag_stale.fetch_add(stale, std::memory_order_relaxed);
+        diag_image_changed.fetch_add(changed, std::memory_order_relaxed);
+        if ((stale || changed) && diag_detail_left > 0) {
+            --diag_detail_left;
+            std::printf("Native present diag: flip of %llx: image %p (before %p), written by submission "
+                        "%llu (before %llu), %llu recorded%s\n",
+                        (unsigned long long)address, (void*)s.image, (void*)lf.image,
+                        (unsigned long long)s.written_k, (unsigned long long)lf.written_k,
+                        (unsigned long long)now_k, stale ? ": SAME FRAME AGAIN" : "");
+        }
+        lf.image = s.image;
+        lf.written_k = s.written_k;
     }
     vk::Format f = s.format;
     if (f == vk::Format::eR8G8B8A8Unorm || f == vk::Format::eR8G8B8A8Srgb) {
@@ -5159,6 +5214,31 @@ bool Display(std::uint64_t address, std::uint32_t wanted, std::uint64_t* image,
     *width = s.width;
     *height = s.height;
     return true;
+}
+
+std::uint64_t NextPresentSeq() {
+    return diag_present_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+void NotePresentSeq(std::uint64_t seq) {
+    if (seq == 0) {
+        return;
+    }
+    diag_presented.fetch_add(1, std::memory_order_relaxed);
+    const u64 last = diag_last_presented.load(std::memory_order_relaxed);
+    if (seq <= last) {
+        diag_out_of_order.fetch_add(1, std::memory_order_relaxed);
+        if (diag_detail_left > 0) {
+            --diag_detail_left;
+            std::printf("Native present diag: presenter showed frame %llu after frame %llu\n",
+                        (unsigned long long)seq, (unsigned long long)last);
+        }
+        return;
+    }
+    if (seq > last + 1 && last != 0) {
+        diag_skipped.fetch_add(seq - last - 1, std::memory_order_relaxed);
+    }
+    diag_last_presented.store(seq, std::memory_order_relaxed);
 }
 
 void NoteFlip(std::uint64_t address) {

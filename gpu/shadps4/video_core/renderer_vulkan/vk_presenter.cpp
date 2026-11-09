@@ -615,6 +615,7 @@ Frame* Presenter::PrepareNativeFrame(const Libraries::VideoOut::BufferAttributeG
     BbStats::frame_number.fetch_add(1, std::memory_order_relaxed);
     frame->ready_semaphore = scheduler.GetWorkSemaphore()->Handle();
     frame->ready_tick = scheduler.CurrentTick();
+    frame->bb_seq = BbNativeVk::NextPresentSeq();
     SubmitInfo info{};
     scheduler.Flush(info);
     return frame;
@@ -694,6 +695,10 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
 }
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
+    BbNativeVk::NotePresentSeq(is_reusing_frame ? 0 : frame->bb_seq);
+    if (!is_reusing_frame) {
+        frame->bb_seq = 0;
+    }
     // Free the frame for reuse
     const auto free_frame = [&] {
         if (!is_reusing_frame) {

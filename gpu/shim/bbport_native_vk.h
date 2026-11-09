@@ -63,4 +63,9 @@ bool Display(std::uint64_t address, std::uint32_t wanted, std::uint64_t* image,
 void NoteFlip(std::uint64_t address);
 /// The presenter's read of the oldest flip of `address` is on the queue (or was given up).
 void Presented(std::uint64_t address);
+
+/// Diagnostics (log line "Native present diag"): PrepareNativeFrame numbers its frames
+/// (NextPresentSeq), the presenter reports each one it presents (NotePresentSeq; 0: not one).
+std::uint64_t NextPresentSeq();
+void NotePresentSeq(std::uint64_t seq);
 } // namespace BbNativeVk

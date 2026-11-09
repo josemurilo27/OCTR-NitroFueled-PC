@@ -150,7 +150,7 @@ jobs:
           BB_VERSION: v0.8.3
         run: |
           set -euo pipefail
-          version=v0.8.3-correcao-native
+          version=v0.8.3-correcao-native-diag
           bash build.sh
           python3 packaging/windows/make_portable.py --version "$version"
           asset="CTR-NitroFueled-PC-portable-${version}-windows.zip"
